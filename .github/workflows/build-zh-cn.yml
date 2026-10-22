@@ -1,0 +1,285 @@
+name: Build zh-CN nightly
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if this nightly release already exists
+        required: false
+        type: boolean
+        default: false
+  push:
+    paths:
+      - '.github/workflows/build-zh-cn.yml'
+      - 'localization/**'
+      - 'README.zh-CN.md'
+
+concurrency:
+  group: build-zh-cn-nightly
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: 'utf-8'
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    name: Sync, localize and package
+    runs-on: windows-2025
+    permissions:
+      # Required to push the synchronized source and publish release assets.
+      contents: write
+      actions: read
+
+    steps:
+      - name: Checkout localization fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve latest upstream nightly
+        id: upstream
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = Invoke-RestMethod `
+            -Uri 'https://api.github.com/repos/yt-dlp/yt-dlp-nightly-builds/releases/latest' `
+            -Headers @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept = 'application/vnd.github+json'
+              'X-GitHub-Api-Version' = '2022-11-28'
+              'User-Agent' = 'yt-dlp-zh-nightly-builder'
+            }
+          $match = [regex]::Match(
+            $release.body,
+            'Generated from: https://github\.com/yt-dlp/yt-dlp/commit/(?<commit>[0-9a-f]{40})')
+          if (-not $match.Success) {
+            throw "Could not find the source commit in upstream release $($release.tag_name)"
+          }
+          "tag=$($release.tag_name)" >> $env:GITHUB_OUTPUT
+          "commit=$($match.Groups['commit'].Value)" >> $env:GITHUB_OUTPUT
+          "published=$($release.published_at)" >> $env:GITHUB_OUTPUT
+
+      - name: Check whether release already exists
+        id: release_check
+        shell: pwsh
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $response = Invoke-WebRequest `
+            -Uri "https://api.github.com/repos/$env:REPOSITORY/releases/tags/$env:TAG" `
+            -Headers @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept = 'application/vnd.github+json'
+              'X-GitHub-Api-Version' = '2022-11-28'
+              'User-Agent' = 'yt-dlp-zh-nightly-builder'
+            } `
+            -SkipHttpErrorCheck
+          $exists = $response.StatusCode -eq 200
+          $needed = (-not $exists) -or ($env:EVENT_NAME -eq 'push') -or ($env:FORCE -eq 'true')
+          "exists=$($exists.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "needed=$($needed.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
+      - name: Preserve localization overlay
+        if: steps.release_check.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assetRoot = Join-Path $env:RUNNER_TEMP 'yt-dlp-zh-overlay'
+          New-Item -ItemType Directory -Force -Path $assetRoot | Out-Null
+          Copy-Item -Recurse -Force 'localization' $assetRoot
+          Copy-Item -Recurse -Force '.github/workflows/build-zh-cn.yml' $assetRoot
+          Copy-Item -Force 'README.zh-CN.md' $assetRoot
+          "OVERLAY_ROOT=$assetRoot" >> $env:GITHUB_ENV
+
+      - name: Fetch exact upstream nightly source
+        if: steps.release_check.outputs.needed == 'true'
+        shell: pwsh
+        env:
+          COMMIT: ${{ steps.upstream.outputs.commit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git rev-parse HEAD | ForEach-Object { "OLD_MASTER=$_" >> $env:GITHUB_ENV }
+          git fetch --no-tags --depth=1 https://github.com/yt-dlp/yt-dlp.git $env:COMMIT
+          git checkout --detach FETCH_HEAD
+
+      - name: Apply localization overlay
+        if: steps.release_check.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item -Recurse -Force "$env:OVERLAY_ROOT/localization" .
+          New-Item -ItemType Directory -Force -Path '.github/workflows' | Out-Null
+          Copy-Item -Force "$env:OVERLAY_ROOT/build-zh-cn.yml" '.github/workflows/build-zh-cn.yml'
+          Copy-Item -Force "$env:OVERLAY_ROOT/README.zh-CN.md" '.'
+
+      - name: Configure Python
+        if: steps.release_check.outputs.needed == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.14'
+          architecture: 'x64'
+
+      - name: Validate localization coverage
+        if: steps.release_check.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -W error localization/check_localization.py --require-complete
+
+      - name: Install pinned build dependencies
+        if: steps.release_check.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $venv = Join-Path $env:RUNNER_TEMP 'yt-dlp-build-venv'
+          python -m venv $venv
+          & "$venv/Scripts/Activate.ps1"
+          python -m pip install -U --require-hashes -r bundle/requirements/pip.txt
+          python -m pip install -U --require-hashes -r bundle/requirements/win-x64-pyinstaller.txt
+          python -m pip install -U --require-hashes -r bundle/requirements/curl-cffi.txt
+          "VENV_PATH=$venv" >> $env:GITHUB_ENV
+
+      - name: Stamp fork version and build extractor index
+        if: steps.release_check.outputs.needed == 'true'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & "$env:VENV_PATH/Scripts/Activate.ps1"
+          python devscripts/update-version.py `
+            --channel nightly `
+            --origin $env:REPOSITORY `
+            --suffix zh `
+            $env:TAG
+          python devscripts/make_lazy_extractors.py
+
+      - name: Build localized Windows executable
+        if: steps.release_check.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & "$env:VENV_PATH/Scripts/Activate.ps1"
+          python -m bundle.pyinstaller --runtime-hook localization/zh_cn_runtime.py
+          Copy-Item -Force 'dist/yt-dlp.exe' 'dist/yt-dlp_zh.exe'
+
+      - name: Verify Chinese executable
+        if: steps.release_check.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = (& './dist/yt-dlp.exe' --version | Out-String).Trim()
+          if (-not $version) {
+            throw 'Version check returned an empty value'
+          }
+          & './dist/yt-dlp.exe' --help | Out-File -Encoding utf8NoBOM 'dist/help-zh.txt'
+          $help = Get-Content -Raw -Encoding utf8 'dist/help-zh.txt'
+          foreach ($marker in @('通用选项', '下载选项', '字幕选项', '后处理选项')) {
+            if (-not $help.Contains($marker)) {
+              throw "Localized help is missing marker: $marker"
+            }
+          }
+          if ($help.Contains('General Options') -or $help.Contains('Download Options')) {
+            throw 'English help headings remain in the localized executable'
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Generate checksums and release metadata
+        if: steps.release_check.outputs.needed == 'true'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          COMMIT: ${{ steps.upstream.outputs.commit }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hashes = @()
+          foreach ($name in @('yt-dlp.exe', 'yt-dlp_zh.exe')) {
+            $hash = (Get-FileHash -Algorithm SHA256 "dist/$name").Hash.ToLowerInvariant()
+            $hashes += "$hash  $name"
+          }
+          $hashes | Set-Content -Encoding utf8NoBOM 'dist/SHA2-256SUMS'
+          @(
+            '# This update-spec intentionally has no entry for this repository.'
+            '# A non-matching lockV2 entry makes yt-dlp use the release tag directly.'
+            'lockV2 PorkLittleHamburger/yt-dlp-update-policy 1970.01.01 .+'
+          ) | Set-Content -Encoding utf8NoBOM 'dist/_update_spec'
+          @"
+          # yt-dlp 简体中文 nightly $env:TAG
+
+          此版本由 [PorkLittleHamburger/yt-dlp](https://github.com/PorkLittleHamburger/yt-dlp) 自动构建。
+
+          - 上游 nightly：`$env:TAG`
+          - 上游提交：`$env:COMMIT`
+          - 本地化版本：`$env:VERSION`
+          - 平台：Windows 10+ x64
+          - 构建来源：[workflow run](https://github.com/$env:REPOSITORY/actions/runs/$env:RUN_ID)
+
+          ## 改动范围
+
+          本包在不修改站点提取器、格式选择、认证、Cookie 和下载逻辑的前提下，
+          将命令帮助、选项分组、常见下载状态、警告和错误提示本地化为简体中文。
+
+          ## 文件
+
+          - `yt-dlp.exe`：可执行程序
+          - `yt-dlp_zh.exe`：同名中文构建，便于识别
+          - `SHA2-256SUMS`：SHA-256 校验文件
+          - `help-zh.txt`：该程序实际输出的中文帮助
+
+          FFmpeg/ffprobe 未包含在单文件程序中。设置 `YT_DLP_LANG=en`
+          可以临时禁用本地化。
+          "@ | Set-Content -Encoding utf8NoBOM 'dist/release-notes.md'
+
+      - name: Commit synchronized source
+        if: steps.release_check.outputs.needed == 'true'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m "Sync nightly $env:TAG with zh-CN localization [skip ci]"
+          git push --force-with-lease="master:$env:OLD_MASTER" origin HEAD:master
+
+      - name: Publish release
+        if: steps.release_check.outputs.needed == 'true'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $remoteTag = git ls-remote --tags origin "refs/tags/$env:TAG"
+          if (-not $remoteTag) {
+            git tag $env:TAG
+            git push origin "refs/tags/$env:TAG"
+          }
+          gh release create $env:TAG `
+            'dist/yt-dlp.exe' `
+            'dist/yt-dlp_zh.exe' `
+            'dist/help-zh.txt' `
+            'dist/SHA2-256SUMS' `
+            'dist/_update_spec' `
+            --title "yt-dlp zh-CN $env:TAG" `
+            --notes-file 'dist/release-notes.md' `
+            --latest
